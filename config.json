@@ -1,0 +1,40 @@
+{
+    "telegram": {
+        "bot_token": "8168829272:AAEdBli_8E0Du_uHVTGLRLCN6KV7Gwox0WQ",
+        "admin_id": 1190237801,
+        "main_channel": -1003798444695,
+        "redirect_channels": [],
+        "notification_on_error": true
+    },
+    "app": {
+        "language": "FR",
+        "check_interval_seconds": 30,
+        "verification_attempts": 3,
+        "min_games_for_analysis": 50,
+        "prediction_cycle_size": 3
+    },
+    "api": {
+        "url": "https://1xbet.com/service-api/LiveFeed/GetSportsShortZip",
+        "params": {
+            "sports": 236,
+            "champs": 2050671,
+            "lng": "en",
+            "gr": 285,
+            "country": 96,
+            "virtualSports": "true",
+            "groupChamps": "true"
+        },
+        "timeout": 30
+    },
+    "features": {
+        "multi_language": true,
+        "file_upload": true,
+        "auto_redirect": false,
+        "detailed_stats": true
+    },
+    "paths": {
+        "daily_stats": "daily_stats.json",
+        "uploads_dir": "uploads/",
+        "logs_dir": "logs/"
+    }
+}
