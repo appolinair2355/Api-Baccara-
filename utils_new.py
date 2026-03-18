@@ -138,22 +138,35 @@ def get_latest_results():
 
 
 def update_history(results, history):
-    """Met à jour l'historique avec les jeux terminés."""
+    """Met à jour l'historique avec les jeux terminés.
+    Un jeu déjà stocké est toujours mis à jour pour capturer la 3ème carte
+    qui peut arriver dans un appel API ultérieur.
+    """
     print("[Historique] Mise à jour de l'historique...")
     added = 0
+    updated = 0
     for result in results:
         if result["is_finished"]:
             game_number = result["game_number"]
+            new_entry = {
+                "player_cards": result["player_cards"],
+                "banker_cards": result["banker_cards"],
+                "winner": result.get("winner"),
+                "score": result.get("score"),
+                "is_finished": True
+            }
             if game_number not in history:
-                history[game_number] = {
-                    "player_cards": result["player_cards"],
-                    "banker_cards": result["banker_cards"],
-                    "winner": result.get("winner"),
-                    "score": result.get("score"),
-                    "is_finished": True
-                }
+                history[game_number] = new_entry
                 added += 1
                 print(f"[Historique] Jeu #{game_number} ajouté | Gagnant: {result.get('winner')}")
-    if added > 0:
-        print(f"[Historique] {added} nouveau(x) jeu(x) ajouté(s). Total: {len(history)}")
+            else:
+                old = history[game_number]
+                old_b = len(old.get("banker_cards", []))
+                new_b = len(result["banker_cards"])
+                if new_b > old_b:
+                    history[game_number] = new_entry
+                    updated += 1
+                    print(f"[Historique] Jeu #{game_number} mis à jour | Banquier: {old_b}→{new_b} cartes")
+    if added > 0 or updated > 0:
+        print(f"[Historique] {added} ajouté(s), {updated} mis à jour. Total: {len(history)}")
     return history

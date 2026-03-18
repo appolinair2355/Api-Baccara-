@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot Telegram Baccara - Système de prédiction complet
-Intègre config.json pour la configuration environnementale
+Bot Telegram Baccara - Système de redirection de données
+Récupère les données de l'API 1xBet, les transforme et les redistribue
+vers plus de 20 canaux Telegram simultanément.
 """
 
 import os
-import sys
 import json
-import time
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional
+
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue,
-    MessageHandler, filters, ConversationHandler
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    MessageHandler, filters
 )
 from web_server import start_web_server, set_bot
 
-# Import des modules locaux
-from strategies import StrategyManager, StrategyTroisCartes
-from strategies_intervalles import StrategieIntervalles
 from utils_new import get_latest_results, update_history
 
-# Configuration du logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -41,7 +37,6 @@ class ConfigManager:
         self.config = self._load_config()
 
     def _load_config(self) -> Dict:
-        """Charge la configuration depuis le fichier JSON."""
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
@@ -53,44 +48,37 @@ class ConfigManager:
             raise
 
     def get(self, section: str, key: str = None, default=None):
-        """Récupère une valeur de configuration."""
         if key is None:
             return self.config.get(section, default)
         return self.config.get(section, {}).get(key, default)
 
     def update(self, section: str, key: str, value):
-        """Met à jour une valeur de configuration."""
         if section not in self.config:
             self.config[section] = {}
         self.config[section][key] = value
         self._save_config()
 
     def _save_config(self):
-        """Sauvegarde la configuration."""
         with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=4, ensure_ascii=False)
 
 
 class BaccaraBot:
-    """Bot principal de prédiction Baccara."""
+    """Bot de redirection Baccara — collecte, transforme et diffuse vers 20+ canaux."""
 
     def __init__(self, config_path: str = "config.json"):
-        # Chargement de la configuration
         self.config = ConfigManager(config_path)
 
         # Configuration Telegram
         self.token = self.config.get('telegram', 'bot_token')
         self.admin_id = self.config.get('telegram', 'admin_id')
         self.main_channel = self.config.get('telegram', 'main_channel')
-        self.redirect_channels = self.config.get('telegram', 'redirect_channels', [])
+        self.redirect_channels: List[int] = self.config.get('telegram', 'redirect_channels', [])
         self.notify_on_error = self.config.get('telegram', 'notification_on_error', True)
 
         # Configuration App
         self.language = self.config.get('app', 'language', 'FR')
-        self.check_interval = self.config.get('app', 'check_interval_seconds', 30)
-        self.verification_attempts = self.config.get('app', 'verification_attempts', 3)
-        self.min_games = self.config.get('app', 'min_games_for_analysis', 50)
-        self.cycle_size = self.config.get('app', 'prediction_cycle_size', 3)
+        self.check_interval = self.config.get('app', 'check_interval_seconds', 15)
 
         # Configuration API
         self.api_url = self.config.get('api', 'url')
@@ -98,726 +86,40 @@ class BaccaraBot:
         self.api_timeout = self.config.get('api', 'timeout', 30)
 
         # État interne
-        self.history = {}
-        self.strategy_manager = StrategyManager()
-        self.strategy_trois_cartes = StrategyTroisCartes()
-        self.trois_cartes_predicted = set()  # Jeux déjà prédits par la stratégie 3-cartes
-        self.daily_stats = self._load_daily_stats()
-        self.active_predictions = []
-        self.is_running = True   # Collecte de données active dès le démarrage
-        self.predictions_enabled = True  # Envoi de prédictions actif par défaut
-        self.last_check = None
-        self.last_api_game = None
+        self.history: Dict = {}
+        self.is_running = True
+        self.last_check: Optional[datetime] = None
+        self.last_api_game: Optional[Dict] = None
+        self.last_results: List[Dict] = []
+        self.seen_game_nums: set = set()   # jeux entièrement traités (terminés, message envoyé/édité)
+        self.pending_games: Dict = {}      # jeux en cours déjà envoyés → {gnum: [(channel_id, msg_id)...]}
 
-        # Traductions
-        self.translations = self._load_translations()
+        # Publicité automatique
+        self.pub_message = ""
+        self.pub_enabled = False
+        self.pub_interval_minutes = 30
+        self.pub_job = None
 
-        logger.info(f"Bot initialisé - Canal: {self.main_channel}, Admin: {self.admin_id}")
+        # Pub basée sur le nombre de jeux redirigés
+        self.pub_every_n_games = 0      # 0 = désactivé
+        self.pub_games_counter = 0      # compteur de jeux redirigés depuis la dernière pub
 
-    def _load_translations(self) -> Dict:
-        """Charge les traductions multilingues."""
-        return {
-            'FR': {
-                'prediction_title': '🔮 PRÉDICTION BACCARA',
-                'symbol': 'Enseigne',
-                'game': 'Jeu #',
-                'confidence': 'Confiance',
-                'strategy': 'Stratégie',
-                'waiting_result': '⏳ En attente du résultat...',
-                'win': '✅ GAGNÉ',
-                'loss': '❌ PERDU',
-                'verified': 'Résultat vérifié',
-                'next_check': 'Prochaine analyse dans {} secondes',
-                'bot_started': '🤖 Bot démarré! Surveillance active.',
-                'bot_stopped': '🛑 Bot arrêté.',
-                'no_prediction': 'Aucune prédiction pour le moment.',
-                'stats_title': '📊 STATISTIQUES DU JOUR',
-                'total': 'Total',
-                'wins': 'Gagnés',
-                'losses': 'Perdus',
-                'win_rate': 'Taux de réussite',
-                'admin_only': "⚠️ Seul l'administrateur peut utiliser cette commande.",
-                'config_updated': '✅ Configuration mise à jour.',
-                'current_config': '⚙️ Configuration actuelle',
-                'status_running': "🟢 Bot en cours d'exécution",
-                'status_stopped': '🔴 Bot arrêté',
-                'last_check': 'Dernière vérification',
-                'predictions_pending': 'Prédictions en attente',
-                'games_history': "Jeux dans l'historique"
-            },
-            'EN': {
-                'prediction_title': '🔮 BACCARA PREDICTION',
-                'symbol': 'Suit',
-                'game': 'Game #',
-                'confidence': 'Confidence',
-                'strategy': 'Strategy',
-                'waiting_result': '⏳ Waiting for result...',
-                'win': '✅ WIN',
-                'loss': '❌ LOSS',
-                'verified': 'Result verified',
-                'next_check': 'Next analysis in {} seconds',
-                'bot_started': '🤖 Bot started! Active monitoring.',
-                'bot_stopped': '🛑 Bot stopped.',
-                'no_prediction': 'No prediction at the moment.',
-                'stats_title': '📊 TODAY STATISTICS',
-                'total': 'Total',
-                'wins': 'Wins',
-                'losses': 'Losses',
-                'win_rate': 'Win rate',
-                'admin_only': '⚠️ Only admin can use this command.',
-                'config_updated': '✅ Configuration updated.',
-                'current_config': '⚙️ Current configuration',
-                'status_running': '🟢 Bot running',
-                'status_stopped': '🔴 Bot stopped',
-                'last_check': 'Last check',
-                'predictions_pending': 'Pending predictions',
-                'games_history': 'Games in history'
-            },
-            'ES': {
-                'prediction_title': '🔮 PREDICCIÓN BACCARA',
-                'symbol': 'Palo',
-                'game': 'Juego #',
-                'confidence': 'Confianza',
-                'strategy': 'Estrategia',
-                'waiting_result': '⏳ Esperando resultado...',
-                'win': '✅ GANADO',
-                'loss': '❌ PERDIDO',
-                'verified': 'Resultado verificado',
-                'next_check': 'Próximo análisis en {} segundos',
-                'bot_started': '🤖 Bot iniciado! Monitoreo activo.',
-                'bot_stopped': '🛑 Bot detenido.',
-                'no_prediction': 'Sin predicción por el momento.',
-                'stats_title': '📊 ESTADÍSTICAS DE HOY',
-                'total': 'Total',
-                'wins': 'Ganados',
-                'losses': 'Perdidos',
-                'win_rate': 'Tasa de acierto',
-                'admin_only': '⚠️ Solo el admin puede usar este comando.',
-                'config_updated': '✅ Configuración actualizada.',
-                'current_config': '⚙️ Configuración actual',
-                'status_running': '🟢 Bot en ejecución',
-                'status_stopped': '🔴 Bot detenido',
-                'last_check': 'Última verificación',
-                'predictions_pending': 'Predicciones pendientes',
-                'games_history': 'Juegos en historial'
-            },
-            'DE': {
-                'prediction_title': '🔮 BACCARA VORHERSAGE',
-                'symbol': 'Farbe',
-                'game': 'Spiel #',
-                'confidence': 'Vertrauen',
-                'strategy': 'Strategie',
-                'waiting_result': '⏳ Warte auf Ergebnis...',
-                'win': '✅ GEWONNEN',
-                'loss': '❌ VERLOREN',
-                'verified': 'Ergebnis überprüft',
-                'next_check': 'Nächste Analyse in {} Sekunden',
-                'bot_started': '🤖 Bot gestartet! Aktive Überwachung.',
-                'bot_stopped': '🛑 Bot gestoppt.',
-                'no_prediction': 'Momentan keine Vorhersage.',
-                'stats_title': '📊 HEUTIGE STATISTIK',
-                'total': 'Gesamt',
-                'wins': 'Gewonnen',
-                'losses': 'Verloren',
-                'win_rate': 'Erfolgsrate',
-                'admin_only': '⚠️ Nur Admin kann diesen Befehl verwenden.',
-                'config_updated': '✅ Konfiguration aktualisiert.',
-                'current_config': '⚙️ Aktuelle Konfiguration',
-                'status_running': '🟢 Bot läuft',
-                'status_stopped': '🔴 Bot gestoppt',
-                'last_check': 'Letzte Überprüfung',
-                'predictions_pending': 'Ausstehende Vorhersagen',
-                'games_history': 'Spiele im Verlauf'
-            },
-            'RU': {
-                'prediction_title': '🔮 ПРЕДСКАЗАНИЕ БАККАРА',
-                'symbol': 'Масть',
-                'game': 'Игра #',
-                'confidence': 'Уверенность',
-                'strategy': 'Стратегия',
-                'waiting_result': '⏳ Ожидание результата...',
-                'win': '✅ ВЫИГРЫШ',
-                'loss': '❌ ПРОИГРЫШ',
-                'verified': 'Результат проверен',
-                'next_check': 'Следующий анализ через {} секунд',
-                'bot_started': '🤖 Бот запущен! Активное наблюдение.',
-                'bot_stopped': '🛑 Бот остановлен.',
-                'no_prediction': 'Пока нет предсказаний.',
-                'stats_title': '📊 СТАТИСТИКА ЗА СЕГОДНЯ',
-                'total': 'Всего',
-                'wins': 'Выигрыши',
-                'losses': 'Проигрыши',
-                'win_rate': 'Процент побед',
-                'admin_only': '⚠️ Только админ может использовать эту команду.',
-                'config_updated': '✅ Конфигурация обновлена.',
-                'current_config': '⚙️ Текущая конфигурация',
-                'status_running': '🟢 Бот работает',
-                'status_stopped': '🔴 Бот остановлен',
-                'last_check': 'Последняя проверка',
-                'predictions_pending': 'Ожидающие предсказания',
-                'games_history': 'Игр в истории'
-            },
-            'AR': {
-                'prediction_title': '🔮 توقع البكارات',
-                'symbol': 'الرمز',
-                'game': 'لعبة #',
-                'confidence': 'الثقة',
-                'strategy': 'الاستراتيجية',
-                'waiting_result': '⏳ في انتظار النتيجة...',
-                'win': '✅ فوز',
-                'loss': '❌ خسارة',
-                'verified': 'تم التحقق من النتيجة',
-                'next_check': 'التحليل التالي بعد {} ثانية',
-                'bot_started': '🤖 تم تشغيل البوت! المراقبة نشطة.',
-                'bot_stopped': '🛑 تم إيقاف البوت.',
-                'no_prediction': 'لا يوجد توقع في الوقت الحالي.',
-                'stats_title': '📊 إحصائيات اليوم',
-                'total': 'المجموع',
-                'wins': 'الفوز',
-                'losses': 'الخسارة',
-                'win_rate': 'معدل الفوز',
-                'admin_only': '⚠️ المشرف فقط يمكنه استخدام هذا الأمر.',
-                'config_updated': '✅ تم تحديث الإعدادات.',
-                'current_config': '⚙️ الإعدادات الحالية',
-                'status_running': '🟢 البوت يعمل',
-                'status_stopped': '🔴 البوت متوقف',
-                'last_check': 'آخر فحص',
-                'predictions_pending': 'توقعات معلقة',
-                'games_history': 'ألعاب في السجل'
-            }
-        }
+        # Emoji personnalisable pour les jeux en cours
+        self.pending_emoji = self.config.get('app', 'pending_emoji', '⏰')
 
-    def _t(self, key: str) -> str:
-        """Récupère une traduction."""
-        return self.translations.get(self.language, self.translations['FR']).get(key, key)
+        logger.info(f"Bot initialisé — Canal principal: {self.main_channel}, Canaux: {len(self.redirect_channels)}, Admin: {self.admin_id}")
+
+    # ─────────────────────────────────────────────
+    # UTILITAIRES
+    # ─────────────────────────────────────────────
 
     def _is_admin(self, user_id: int) -> bool:
-        """Vérifie si l'utilisateur est l'admin."""
         return user_id == self.admin_id
 
-    def _load_daily_stats(self) -> Dict:
-        """Charge les statistiques journalières."""
-        today = datetime.now().strftime('%Y-%m-%d')
-        stats_path = self.config.get('paths', 'daily_stats', 'daily_stats.json')
-        try:
-            with open(stats_path, 'r') as f:
-                stats = json.load(f)
-                return stats.get(today, {'total_predictions': 0, 'wins': 0, 'losses': 0, 'win_rate': 0.0})
-        except FileNotFoundError:
-            return {'total_predictions': 0, 'wins': 0, 'losses': 0, 'win_rate': 0.0}
-
-    def _save_daily_stats(self):
-        """Sauvegarde les statistiques journalières."""
-        today = datetime.now().strftime('%Y-%m-%d')
-        stats_path = self.config.get('paths', 'daily_stats', 'daily_stats.json')
-        try:
-            with open(stats_path, 'r') as f:
-                stats = json.load(f)
-        except FileNotFoundError:
-            stats = {}
-
-        stats[today] = self.daily_stats
-        with open(stats_path, 'w') as f:
-            json.dump(stats, f, indent=4)
-
-    # ========== COMMANDES TELEGRAM ==========
-
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /start - Menu principal."""
-        user = update.effective_user
-        logger.info(f"User {user.id} started the bot")
-
-        keyboard = [
-            [InlineKeyboardButton("▶️ Démarrer", callback_data='start_bot'),
-             InlineKeyboardButton("⏹ Arrêter", callback_data='stop_bot')],
-            [InlineKeyboardButton("📊 Statistiques", callback_data='stats'),
-             InlineKeyboardButton("⚙️ Configuration", callback_data='config')],
-            [InlineKeyboardButton("📈 Status", callback_data='status')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            f"🎰 *Bot Baccara*\n\n"
-            f"Bienvenue {user.first_name}!\n"
-            f"Ce bot analyse les patterns du Baccara et envoie des prédictions.\n\n"
-            f"📡 Canal: `{self.main_channel}`\n"
-            f"🌍 Langue: `{self.language}`\n"
-            f"⏱ Intervalle: `{self.check_interval}s`",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /stats - Affiche les statistiques."""
-        await update.message.reply_text(self._format_stats(), parse_mode='Markdown')
-
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /status - État du bot."""
-        await update.message.reply_text(self._build_status_text(), parse_mode='Markdown')
-
-    async def config_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /config - Modifie la configuration (admin only)."""
-        user = update.effective_user
-
-        if not self._is_admin(user.id):
-            await update.message.reply_text(self._t('admin_only'))
-            return
-
-        text, reply_markup = self._build_config_message()
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-    def _build_config_message(self):
-        """Construit le message de configuration avec son clavier."""
-        keyboard = [
-            [InlineKeyboardButton("🌍 Langue", callback_data='cfg_language'),
-             InlineKeyboardButton("⏱ Intervalle", callback_data='cfg_interval')],
-            [InlineKeyboardButton("🔄 Redirection", callback_data='cfg_redirect'),
-             InlineKeyboardButton("✅ Tentatives", callback_data='cfg_attempts')]
-        ]
-        text = (
-            f"⚙️ *{self._t('current_config')}*\n\n"
-            f"🌍 Langue: `{self.language}`\n"
-            f"⏱ Intervalle: `{self.check_interval}s`\n"
-            f"✅ Tentatives: `{self.verification_attempts}`\n"
-            f"📡 Canal: `{self.main_channel}`\n"
-            f"🔄 Redirection: `{len(self.redirect_channels)} canaux`"
-        )
-        return text, InlineKeyboardMarkup(keyboard)
-
-    def _build_status_text(self) -> str:
-        """Construit le texte de statut."""
-        collecte = "🟢 Active" if self.is_running else "🔴 Arrêtée"
-        predictions = "🟢 Activées" if self.predictions_enabled else "🔴 Désactivées"
-        last_check = self.last_check.strftime('%H:%M:%S') if self.last_check else 'Jamais'
-        last_game = f"#{self.last_api_game['game_number']}" if self.last_api_game else 'En attente...'
-        return (
-            f"📊 *État du Bot*\n\n"
-            f"📡 Collecte de données : {collecte}\n"
-            f"🔮 Envoi de prédictions : {predictions}\n"
-            f"🕐 {self._t('last_check')}: `{last_check}`\n"
-            f"🔢 Dernier jeu API: `{last_game}`\n"
-            f"📋 {self._t('predictions_pending')}: `{len(self.active_predictions)}`\n"
-            f"🎮 {self._t('games_history')}: `{len(self.history)}`\n\n"
-            f"📡 Canal: `{self.main_channel}`\n"
-            f"👤 Admin: `{self.admin_id}`"
-        )
-
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Gère les callbacks de tous les boutons inline."""
-        query = update.callback_query
-        await query.answer()
-        user = query.from_user
-
-        # ── Boutons du menu principal ──────────────────────────────────────
-        if query.data == 'start_bot':
-            if self._is_admin(user.id):
-                await self._start_bot(query)
-            else:
-                await query.edit_message_text(self._t('admin_only'))
-
-        elif query.data == 'stop_bot':
-            if self._is_admin(user.id):
-                await self._stop_bot(query, context)
-            else:
-                await query.edit_message_text(self._t('admin_only'))
-
-        elif query.data == 'stats':
-            keyboard = [[InlineKeyboardButton("🔙 Retour", callback_data='menu')]]
-            await query.edit_message_text(
-                self._format_stats(),
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-        elif query.data == 'status':
-            keyboard = [[InlineKeyboardButton("🔙 Retour", callback_data='menu')]]
-            await query.edit_message_text(
-                self._build_status_text(),
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-        elif query.data == 'config':
-            if not self._is_admin(user.id):
-                await query.edit_message_text(self._t('admin_only'))
-                return
-            text, reply_markup = self._build_config_message()
-            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-        elif query.data == 'menu':
-            keyboard = [
-                [InlineKeyboardButton("▶️ Démarrer", callback_data='start_bot'),
-                 InlineKeyboardButton("⏹ Arrêter", callback_data='stop_bot')],
-                [InlineKeyboardButton("📊 Statistiques", callback_data='stats'),
-                 InlineKeyboardButton("⚙️ Configuration", callback_data='config')],
-                [InlineKeyboardButton("📈 Status", callback_data='status')]
-            ]
-            await query.edit_message_text(
-                "🎰 *Bot Baccara* — Menu principal",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-        # ── Boutons de configuration ───────────────────────────────────────
-        elif query.data == 'cfg_language':
-            if not self._is_admin(user.id):
-                await query.edit_message_text(self._t('admin_only'))
-                return
-            langs = ['FR', 'EN', 'ES', 'DE', 'RU', 'AR']
-            keyboard = [
-                [InlineKeyboardButton(
-                    f"{'✅ ' if lg == self.language else ''}{lg}",
-                    callback_data=f'set_lang_{lg}'
-                ) for lg in langs],
-                [InlineKeyboardButton("🔙 Retour", callback_data='config')]
-            ]
-            await query.edit_message_text(
-                f"🌍 *Choisir la langue*\nLangue actuelle: `{self.language}`",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-        elif query.data.startswith('set_lang_'):
-            if not self._is_admin(user.id):
-                await query.edit_message_text(self._t('admin_only'))
-                return
-            new_lang = query.data.replace('set_lang_', '')
-            self.language = new_lang
-            self.config.update('app', 'language', new_lang)
-            text, reply_markup = self._build_config_message()
-            await query.edit_message_text(
-                f"✅ Langue changée en `{new_lang}`\n\n" + text,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-
-        elif query.data == 'cfg_interval':
-            if not self._is_admin(user.id):
-                await query.edit_message_text(self._t('admin_only'))
-                return
-            options = [15, 30, 60, 120]
-            keyboard = [
-                [InlineKeyboardButton(
-                    f"{'✅ ' if iv == self.check_interval else ''}{iv}s",
-                    callback_data=f'set_interval_{iv}'
-                ) for iv in options],
-                [InlineKeyboardButton("🔙 Retour", callback_data='config')]
-            ]
-            await query.edit_message_text(
-                f"⏱ *Choisir l'intervalle de vérification*\nActuel: `{self.check_interval}s`",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-        elif query.data.startswith('set_interval_'):
-            if not self._is_admin(user.id):
-                await query.edit_message_text(self._t('admin_only'))
-                return
-            new_interval = int(query.data.replace('set_interval_', ''))
-            self.check_interval = new_interval
-            self.config.update('app', 'check_interval_seconds', new_interval)
-            text, reply_markup = self._build_config_message()
-            await query.edit_message_text(
-                f"✅ Intervalle changé à `{new_interval}s`\n\n" + text,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-
-        elif query.data == 'cfg_attempts':
-            if not self._is_admin(user.id):
-                await query.edit_message_text(self._t('admin_only'))
-                return
-            options = [1, 2, 3, 5, 10]
-            keyboard = [
-                [InlineKeyboardButton(
-                    f"{'✅ ' if n == self.verification_attempts else ''}{n}",
-                    callback_data=f'set_attempts_{n}'
-                ) for n in options],
-                [InlineKeyboardButton("🔙 Retour", callback_data='config')]
-            ]
-            await query.edit_message_text(
-                f"✅ *Nombre de tentatives de vérification*\nActuel: `{self.verification_attempts}`",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-        elif query.data.startswith('set_attempts_'):
-            if not self._is_admin(user.id):
-                await query.edit_message_text(self._t('admin_only'))
-                return
-            new_attempts = int(query.data.replace('set_attempts_', ''))
-            self.verification_attempts = new_attempts
-            self.config.update('app', 'verification_attempts', new_attempts)
-            text, reply_markup = self._build_config_message()
-            await query.edit_message_text(
-                f"✅ Tentatives changées à `{new_attempts}`\n\n" + text,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
-
-        elif query.data == 'cfg_redirect':
-            keyboard = [[InlineKeyboardButton("🔙 Retour", callback_data='config')]]
-            await query.edit_message_text(
-                f"🔄 *Canaux de redirection*\n\n"
-                f"Canaux actuels: `{self.redirect_channels if self.redirect_channels else 'Aucun'}`\n\n"
-                f"Pour modifier, utilisez la commande:\n`/redirect CHANNEL_ID`",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-    async def _start_bot(self, query):
-        """Active l'envoi de prédictions."""
-        if not self.predictions_enabled:
-            self.predictions_enabled = True
-            await query.edit_message_text(
-                f"✅ {self._t('bot_started')}\n"
-                f"Prédictions activées. Surveillance toutes les {self.check_interval} secondes."
-            )
-        else:
-            await query.edit_message_text("✅ Les prédictions sont déjà actives.")
-
-    async def _stop_bot(self, query, context):
-        """Désactive l'envoi de prédictions (la collecte de données continue)."""
-        self.predictions_enabled = False
-        await query.edit_message_text(
-            f"🛑 {self._t('bot_stopped')}\n"
-            f"_La collecte de données continue en arrière-plan._",
-            parse_mode='Markdown'
-        )
-
-    def _format_stats(self) -> str:
-        """Formate les statistiques."""
-        total = self.daily_stats['total_predictions']
-        wins = self.daily_stats['wins']
-        losses = self.daily_stats['losses']
-        win_rate = self.daily_stats['win_rate']
-
-        return (
-            f"📊 *{self._t('stats_title')}*\n\n"
-            f"• {self._t('total')}: {total}\n"
-            f"• {self._t('wins')}: {wins} ✅\n"
-            f"• {self._t('losses')}: {losses} ❌\n"
-            f"• {self._t('win_rate')}: {win_rate:.1%}"
-        )
-
-    # ========== LOGIQUE PRINCIPALE ==========
-
-    async def check_and_predict(self, context: ContextTypes.DEFAULT_TYPE):
-        """Fonction principale exécutée périodiquement.
-        La collecte de données est TOUJOURS active.
-        Les prédictions ne sont envoyées que si predictions_enabled = True.
-        """
-        try:
-            logger.info("Checking for new data...")
-            self.last_check = datetime.now()
-
-            # 1. Récupérer les nouveaux résultats (toujours)
-            results = get_latest_results()
-            if not results:
-                logger.warning("No data from API")
-                return
-
-            # 2. Mémoriser le dernier jeu récupéré (toujours, même sans prédictions)
-            self.last_api_game = max(results, key=lambda r: r['game_number'])
-
-            # 3. Mettre à jour l'historique
-            old_len = len(self.history)
-            self.history = update_history(results, self.history)
-            new_games = len(self.history) - old_len
-
-            if new_games > 0:
-                logger.info(f"Added {new_games} new games")
-
-            # 4. Si les prédictions sont désactivées, on s'arrête ici
-            if not self.predictions_enabled:
-                return
-
-            # 3. Vérifier les prédictions en attente
-            await self._verify_pending_predictions(context)
-
-            # 4. Générer de nouvelles prédictions (stratégie 3 cartes)
-            prediction = self.strategy_trois_cartes.generate_prediction(
-                self.history, self.trois_cartes_predicted
-            )
-
-            if prediction:
-                self.trois_cartes_predicted.add(prediction['trigger_game'])
-                logger.info(
-                    f"New prediction: {prediction['predicted_suit']} "
-                    f"for game #{prediction['target_game']}"
-                )
-                message_id = await self._send_prediction(context, prediction)
-
-                self.active_predictions.append({
-                    'prediction': prediction,
-                    'timestamp': datetime.now(),
-                    'verified': False,
-                    'result': None,
-                    'message_id': message_id,
-                    'check_offset': 0,
-                })
-
-                self.daily_stats['total_predictions'] += 1
-                self._save_daily_stats()
-
-        except Exception as e:
-            logger.error(f"Error in check_and_predict: {e}")
-            if self.notify_on_error:
-                await self._notify_admin(context, f"Error: {e}")
-
-    SUIT_NAMES = {'♠️': 'Pique', '♣️': 'Trèfle', '♦️': 'Carreau', '♥️': 'Cœur'}
-    OFFSET_EMOJIS = {0: '0️⃣', 1: '1️⃣', 2: '2️⃣', 3: '3️⃣'}
-
-    async def _send_prediction(self, context: ContextTypes.DEFAULT_TYPE, prediction: Dict) -> Optional[int]:
-        """Envoie la prédiction vers le canal et retourne le message_id."""
-        suit = prediction['predicted_suit']
-        suit_name = self.SUIT_NAMES.get(suit, suit)
-        game_num = prediction['target_game']
-
-        text = (
-            f"🎰 PRÉDICTION #{game_num}\n"
-            f"🎯 Couleur: {suit} {suit_name}\n"
-            f"⏳ Statut: EN ATTENTE DU RÉSULTAT..."
-        )
-
-        msg = None
-        try:
-            msg = await context.bot.send_message(
-                chat_id=self.main_channel,
-                text=text
-            )
-            logger.info(f"Prediction sent to {self.main_channel} (msg_id={msg.message_id})")
-
-            for redirect_id in self.redirect_channels:
-                if redirect_id:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=redirect_id,
-                            text=text
-                        )
-                    except Exception as e:
-                        logger.error(f"Redirect failed to {redirect_id}: {e}")
-
-        except Exception as e:
-            logger.error(f"Failed to send prediction: {e}")
-
-        return msg.message_id if msg else None
-
-    async def _verify_pending_predictions(self, context: ContextTypes.DEFAULT_TYPE):
-        """Vérifie les prédictions en attente avec vérification progressive N, N+1, N+2, N+3."""
-        for pred_data in self.active_predictions[:]:
-            if pred_data['verified']:
-                continue
-
-            prediction = pred_data['prediction']
-            target_game = prediction['target_game']
-            predicted_suit = prediction['predicted_suit']
-            offset = pred_data.get('check_offset', 0)
-
-            # Vérifier les offsets depuis le dernier point d'arrêt
-            while offset <= 3:
-                check_game = target_game + offset
-
-                # Si le jeu n'est pas encore dans l'historique, on attend
-                if check_game not in self.history:
-                    break
-
-                game_data = self.history[check_game]
-
-                # Si le jeu n'est pas encore terminé, on attend
-                if not game_data.get('is_finished'):
-                    break
-
-                # Le jeu est disponible : vérifier la couleur dans les cartes du joueur
-                player_cards = game_data.get('player_cards', [])
-                found = self._check_symbol_in_cards(predicted_suit, player_cards)
-
-                if found:
-                    await self._resolve_prediction(context, pred_data, 'win', offset)
-                    break
-                else:
-                    if offset == 3:
-                        # Dernier offset atteint sans succès : PERDU
-                        await self._resolve_prediction(context, pred_data, 'loss', offset)
-                        break
-                    else:
-                        # Passer à l'offset suivant
-                        pred_data['check_offset'] = offset + 1
-                        offset += 1
-
-    async def _resolve_prediction(self, context, pred_data, result, offset: int = 0):
-        """Résout une prédiction en éditant le message original."""
-        prediction = pred_data['prediction']
-        pred_data['verified'] = True
-        pred_data['result'] = result
-
-        suit = prediction['predicted_suit']
-        suit_name = self.SUIT_NAMES.get(suit, suit)
-        game_num = prediction['target_game']
-
-        if result == 'win':
-            self.daily_stats['wins'] += 1
-            offset_emoji = self.OFFSET_EMOJIS.get(offset, '')
-            status = f"✅{offset_emoji} GAGNÉ"
-        else:
-            self.daily_stats['losses'] += 1
-            status = "❌ PERDU"
-
-        text = (
-            f"🎰 PRÉDICTION #{game_num}\n"
-            f"🎯 Couleur: {suit} {suit_name}\n"
-            f"📊 Statut: {status}"
-        )
-
-        # Mettre à jour le win rate
-        total = self.daily_stats['total_predictions']
-        wins = self.daily_stats['wins']
-        self.daily_stats['win_rate'] = wins / total if total > 0 else 0
-
-        # Éditer le message original, ou envoyer un nouveau si pas de message_id
-        message_id = pred_data.get('message_id')
-        try:
-            if message_id:
-                await context.bot.edit_message_text(
-                    chat_id=self.main_channel,
-                    message_id=message_id,
-                    text=text
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=self.main_channel,
-                    text=text
-                )
-        except Exception as e:
-            logger.error(f"Failed to update prediction result: {e}")
-
-        self._save_daily_stats()
-
-    def _check_symbol_in_cards(self, symbol: str, cards: List[Dict]) -> bool:
-        """Vérifie si un symbole est dans les cartes.
-        Supporte les deux formats : emoji (ex: '♠️') et entier (ex: 0).
-        """
-        symbol_int_map = {'♠️': 0, '♣️': 1, '♦️': 2, '♥️': 3}
-        target_int = symbol_int_map.get(symbol, -1)
-
-        for card in cards:
-            if not isinstance(card, dict):
-                continue
-            s = card.get('S')
-            # Comparaison directe emoji → emoji (format utils_new.py)
-            if s == symbol:
-                return True
-            # Comparaison entier → entier (format alternatif)
-            if isinstance(s, int) and s == target_int:
-                return True
-            # raw field (utilisé dans certains formats)
-            raw = card.get('raw')
-            if isinstance(raw, int) and raw == target_int:
-                return True
-        return False
+    def _admin_only_text(self) -> str:
+        return "⚠️ Seul l'administrateur peut utiliser cette commande."
 
     async def _notify_admin(self, context: ContextTypes.DEFAULT_TYPE, message: str):
-        """Notifie l'admin en cas d'erreur."""
         try:
             await context.bot.send_message(
                 chat_id=self.admin_id,
@@ -825,17 +127,42 @@ class BaccaraBot:
                 parse_mode='Markdown'
             )
         except Exception as e:
-            logger.error(f"Failed to notify admin: {e}")
+            logger.error(f"Échec notification admin: {e}")
 
-    # ========== COMMANDES CARTES / JEU ==========
+    def _all_channels(self) -> List[int]:
+        """Retourne tous les canaux uniques (principal + redirections)."""
+        seen = set()
+        result = []
+        for ch in [self.main_channel] + self.redirect_channels:
+            if ch and ch not in seen:
+                seen.add(ch)
+                result.append(ch)
+        return result
+
+    # ─────────────────────────────────────────────
+    # FORMATAGE DES CARTES
+    # ─────────────────────────────────────────────
+
+    def _fmt_rank(self, r) -> str:
+        rank_labels = {0: '10', 1: 'A', 10: '10', 11: 'J', 12: 'Q', 13: 'K'}
+        if isinstance(r, int):
+            return rank_labels.get(r, str(r))
+        return str(r)
+
+    def _fmt_cards_inline(self, cards: List[Dict]) -> str:
+        """Formate les cartes collées : ex. 8♦️2♣️J♦️"""
+        parts = []
+        for c in cards:
+            r = self._fmt_rank(c.get('R', '?'))
+            s = c.get('S', '?')
+            parts.append(f"{r}{s}")
+        return ''.join(parts)
 
     def _format_cards(self, cards: List[Dict]) -> str:
-        """Formate une liste de cartes en texte lisible : ex. ♠️2  ♦️7  ♥️K"""
+        """Formate les cartes espacées : ex. ♠️2  ♦️7  ♥️K"""
         if not cards:
             return '—'
-        rank_labels = {
-            1: 'A', 11: 'J', 12: 'Q', 13: 'K', 14: 'A'
-        }
+        rank_labels = {1: 'A', 11: 'J', 12: 'Q', 13: 'K', 14: 'A'}
         parts = []
         for c in cards:
             suit = c.get('S', '?')
@@ -846,6 +173,132 @@ class BaccaraBot:
                 label = str(rank)
             parts.append(f"{suit}{label}")
         return '  '.join(parts)
+
+    def _calc_baccara_score(self, cards: List[Dict]) -> int:
+        """Calcule le score baccara d'une main (mod 10)."""
+        rank_values = {
+            '10': 0, 'J': 0, 'Q': 0, 'K': 0, 'A': 1,
+            '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
+        }
+        total = 0
+        for card in cards:
+            raw_r = card.get('raw_r', card.get('raw', -1))
+            if isinstance(raw_r, int) and raw_r >= 0:
+                if raw_r == 0 or raw_r >= 10:
+                    total += 0
+                elif raw_r == 1:
+                    total += 1
+                elif 2 <= raw_r <= 9:
+                    total += raw_r
+            else:
+                r = str(card.get('R', ''))
+                total += rank_values.get(r, 0)
+        return total % 10
+
+    def _format_redirect_game_line(self, game_number: int, game_data: Dict) -> str:
+        """
+        Formate un jeu terminé dans le format de redirection.
+        Ex: #N634. ✅2(K♣️J♥️2♠️) - 1(Q♦️Q♥️A♠️) #T3
+            #N633. 6(K♠️2♦️4♦️) 🔰 6(10♥️K♣️6♣️) #T12 🔵#R 🟣#X
+        Tags :
+          🔵#R = partie 2/2 (joueur et banquier ont exactement 2 cartes)
+          🟣#X = égalité (Tie)
+        """
+        if not game_data.get('is_finished', False):
+            return ''
+
+        p_cards = game_data.get('player_cards', [])
+        b_cards = game_data.get('banker_cards', [])
+        p_cards_str = self._fmt_cards_inline(p_cards)
+        b_cards_str = self._fmt_cards_inline(b_cards)
+
+        score = game_data.get('score', {}) or {}
+        p_score = score.get('S1', '')
+        b_score = score.get('S2', '')
+
+        if p_score == '' or p_score is None:
+            p_score = self._calc_baccara_score(p_cards)
+        if b_score == '' or b_score is None:
+            b_score = self._calc_baccara_score(b_cards)
+
+        winner = game_data.get('winner')
+
+        if winner == 'Tie':
+            sep = '🔰'
+            p_prefix = ''
+            b_prefix = ''
+        else:
+            sep = '-'
+            p_prefix = '✅' if winner == 'Player' else ''
+            b_prefix = '✅' if winner == 'Banker' else ''
+
+        try:
+            total = int(p_score) + int(b_score)
+            total_str = f"#T{total}"
+        except (TypeError, ValueError):
+            total_str = "#T?"
+
+        tags = []
+        if len(p_cards) == 2 and len(b_cards) == 2:
+            tags.append('🔵#R')
+        if winner == 'Tie':
+            tags.append('🟣#X')
+
+        line = (
+            f"#N{game_number}. "
+            f"{p_prefix}{p_score}({p_cards_str}) "
+            f"{sep} "
+            f"{b_prefix}{b_score}({b_cards_str}) "
+            f"{total_str}"
+        )
+        if tags:
+            line += ' ' + ' '.join(tags)
+        return line
+
+    def _format_game_line(self, game_number: int, game_data: Dict) -> str:
+        """Formate un jeu en ligne compacte (pour /parties)."""
+        is_finished = game_data.get('is_finished', False)
+        p_cards = game_data.get('player_cards', [])
+        b_cards = game_data.get('banker_cards', [])
+        p_cards_str = self._fmt_cards_inline(p_cards)
+        b_cards_str = self._fmt_cards_inline(b_cards)
+        score = game_data.get('score', {}) or {}
+        p_score = score.get('S1', '')
+        b_score = score.get('S2', '')
+
+        if not is_finished:
+            p_count = len(p_cards)
+            b_count = len(b_cards)
+            if p_count > b_count:
+                p_marker, b_marker = '', '▶️'
+            else:
+                p_marker, b_marker = '▶️', ''
+            p_part = f"{p_marker}{p_score}({p_cards_str})" if p_cards_str else f"{p_marker}(—)"
+            b_part = f"{b_marker}{b_score}({b_cards_str})" if b_cards_str else f"{b_marker}(—)"
+            return f"{self.pending_emoji}#N{game_number}. {p_part} - {b_part}"
+
+        winner = game_data.get('winner')
+        if winner == 'Tie':
+            sep = '🔰'
+            p_prefix = b_prefix = ''
+        else:
+            sep = '-'
+            p_prefix = '✅' if winner == 'Player' else ''
+            b_prefix = '✅' if winner == 'Banker' else ''
+
+        try:
+            total = int(p_score) + int(b_score)
+            total_str = f"#T{total}"
+        except (TypeError, ValueError):
+            total_str = "#T?"
+
+        return (
+            f"#N{game_number}. "
+            f"{p_prefix}{p_score}({p_cards_str}) "
+            f"{sep} "
+            f"{b_prefix}{b_score}({b_cards_str}) "
+            f"{total_str}"
+        )
 
     def _format_single_game(self, game_number: int, game_data: Dict, title: str = "") -> str:
         """Formate les infos complètes d'un jeu."""
@@ -868,7 +321,6 @@ class BaccaraBot:
             winner_str = "⏳ En cours"
 
         etat = "✅ Terminé" if is_finished else "⏳ En cours"
-
         header = f"*{title}* " if title else ""
         return (
             f"{header}🎴 *Jeu #{game_number}*\n"
@@ -879,141 +331,389 @@ class BaccaraBot:
             f"└ {etat}"
         )
 
-    # ========== FORMAT COMPACT DES PARTIES ==========
-
-    def _fmt_rank(self, r) -> str:
-        """Convertit le rang brut en label: 0→10, 1→A, 11→J, 12→Q, 13→K."""
-        rank_labels = {0: '10', 1: 'A', 10: '10', 11: 'J', 12: 'Q', 13: 'K'}
-        if isinstance(r, int):
-            return rank_labels.get(r, str(r))
-        return str(r)
-
-    def _fmt_cards_inline(self, cards: List[Dict]) -> str:
-        """Formate les cartes en ligne collée: ex. 8♦️2♣️J♦️"""
-        parts = []
-        for c in cards:
-            r = self._fmt_rank(c.get('R', '?'))
-            s = c.get('S', '?')
-            parts.append(f"{r}{s}")
-        return ''.join(parts)
-
-    def _format_game_line(self, game_number: int, game_data: Dict) -> str:
+    def _format_game_full(self, game_number: int, game_data: Dict) -> str:
         """
-        Formate un jeu en une ligne compacte.
-        Exemple joueur en cours  : ⏰#N502. ▶️10(8♣️J♥️) - 20(A♠️9♥️)
-        Exemple banquier en cours : ⏰#N499. 19(9♣️10♥️) - ▶️14(Q♠️K♥️)
-        Exemple terminé           : #N485. 0(8♦️2♣️J♦️) - ✅5(10♦️5♠️) #T5
-        Exemple nul               : #N485. 3(8♦️2♣️) 🔰 3(10♦️5♠️) #T6
+        Formate un jeu (terminé ou en cours) dans le format de redirection.
+
+        Terminé  : #N650. 1(3♥️8♠️Q♠️) - ✅4(Q♦️4♦️) #T5
+        Tie      : #N648. 3(Q♦️2♠️) 🔰 3(3♥️K♥️) #T6 #X
+        En cours : ⏰#N650. ▶️1(3♥️8♠️) - 4(Q♦️4♦️)   (joueur n'a pas fini)
+                   ⏰#N648. 3(Q♦️2♠️A♦️) - ▶️3(3♥️K♥️) (banquier n'a pas fini)
+
+        Tags (jeux terminés seulement) :
+          #R = distribution directe (2 cartes chacun)
+          #X = égalité
         """
         is_finished = game_data.get('is_finished', False)
         p_cards = game_data.get('player_cards', [])
         b_cards = game_data.get('banker_cards', [])
         p_cards_str = self._fmt_cards_inline(p_cards)
         b_cards_str = self._fmt_cards_inline(b_cards)
-        score = game_data.get('score', {}) or {}
-        p_score = score.get('S1', '')
-        b_score = score.get('S2', '')
 
-        if not is_finished:
-            p_count = len(p_cards)
-            b_count = len(b_cards)
-            # Si le joueur a plus de cartes que le banquier → c'est le tour du banquier
-            if p_count > b_count:
-                p_marker = ''
-                b_marker = '▶️'
-            else:
-                # Sinon (égal ou banquier en avance) → joueur en cours
-                p_marker = '▶️'
-                b_marker = ''
-            p_score_str = str(p_score) if p_score != '' else ''
-            b_score_str = str(b_score) if b_score != '' else ''
-            p_part = f"{p_marker}{p_score_str}({p_cards_str})" if p_cards_str else f"{p_marker}(—)"
-            b_part = f"{b_marker}{b_score_str}({b_cards_str})" if b_cards_str else f"{b_marker}(—)"
-            return f"⏰#N{game_number}. {p_part} - {b_part}"
+        score = game_data.get('score', {}) or {}
+        p_score = score.get('S1', None)
+        b_score = score.get('S2', None)
+
+        if p_score is None or p_score == '':
+            p_score = self._calc_baccara_score(p_cards) if p_cards else 0
+        if b_score is None or b_score == '':
+            b_score = self._calc_baccara_score(b_cards) if b_cards else 0
 
         winner = game_data.get('winner')
 
-        if winner == 'Tie':
-            sep = '🔰'
-            p_prefix = ''
-            b_prefix = ''
+        if is_finished:
+            if winner == 'Tie':
+                sep = '🔰'
+                p_prefix = ''
+                b_prefix = ''
+            else:
+                sep = '-'
+                p_prefix = '✅' if winner == 'Player' else ''
+                b_prefix = '✅' if winner == 'Banker' else ''
+
+            try:
+                total = int(p_score) + int(b_score)
+                total_str = f"#T{total}"
+            except (TypeError, ValueError):
+                total_str = "#T?"
+
+            p_part = f"{p_prefix}{p_score}({p_cards_str})" if p_cards_str else f"{p_prefix}{p_score}(—)"
+            b_part = f"{b_prefix}{b_score}({b_cards_str})" if b_cards_str else f"{b_prefix}{b_score}(—)"
+
+            line = f"#N{game_number}. {p_part} {sep} {b_part} {total_str}"
+
+            tags = []
+            if len(p_cards) == 2 and len(b_cards) == 2:
+                tags.append('#R')
+            if winner == 'Tie':
+                tags.append('#X')
+            if tags:
+                line += ' ' + ' '.join(tags)
+            return line
+
         else:
-            sep = '-'
-            p_prefix = '✅' if winner == 'Player' else ''
-            b_prefix = '✅' if winner == 'Banker' else ''
+            # En cours : ▶️ sur le côté qui n'a pas encore terminé
+            p_count = len(p_cards)
+            b_count = len(b_cards)
+            if p_count > b_count:
+                p_marker, b_marker = '', '▶️'
+            else:
+                p_marker, b_marker = '▶️', ''
 
-        try:
-            total = int(p_score) + int(b_score)
-            total_str = f"#T{total}"
-        except (TypeError, ValueError):
-            total_str = "#T?"
+            p_part = f"{p_marker}{p_score}({p_cards_str})" if p_cards_str else f"{p_marker}(—)"
+            b_part = f"{b_marker}{b_score}({b_cards_str})" if b_cards_str else f"{b_marker}(—)"
 
+            return f"{self.pending_emoji}#N{game_number}. {p_part} - {b_part}"
+
+    async def _send_single_game_to_channels(self, context, text: str):
+        """Envoie UN jeu terminé vers tous les canaux (pas de tracking)."""
+        for channel_id in self.redirect_channels:
+            if not channel_id:
+                continue
+            try:
+                await context.bot.send_message(chat_id=channel_id, text=text)
+            except Exception as e:
+                logger.error(f"[Redirect] Échec canal {channel_id}: {e}")
+
+    async def _send_and_track_game(self, context, text: str, gnum: int):
+        """Envoie un jeu EN COURS et stocke les IDs + le texte pour suivi."""
+        entries = []
+        for channel_id in self.redirect_channels:
+            if not channel_id:
+                continue
+            try:
+                sent = await context.bot.send_message(chat_id=channel_id, text=text)
+                entries.append((channel_id, sent.message_id))
+            except Exception as e:
+                logger.error(f"[Redirect] Échec canal {channel_id}: {e}")
+        if entries:
+            self.pending_games[gnum] = {"entries": entries, "last_text": text}
+            logger.info(f"[Pending] #N{gnum} → {len(entries)} message(s) suivis")
+
+    async def _edit_game_messages(self, context, gnum: int, new_text: str):
+        """Édite les messages d'un jeu pending si le texte a changé."""
+        pending = self.pending_games.get(gnum)
+        if not pending:
+            return
+        if pending["last_text"] == new_text:
+            return  # Aucun changement, pas d'édition inutile
+        for (channel_id, message_id) in pending["entries"]:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=channel_id,
+                    message_id=message_id,
+                    text=new_text
+                )
+            except Exception as e:
+                logger.error(f"[Edit] Échec canal {channel_id} msg {message_id}: {e}")
+        pending["last_text"] = new_text
+        logger.info(f"[Edit] #N{gnum} mis à jour → {len(pending['entries'])} message(s)")
+
+    # ─────────────────────────────────────────────
+    # FORMATAGE & ENVOI DE LA PUBLICITÉ
+    # ─────────────────────────────────────────────
+
+    def _format_pub_message(self) -> str:
+        """
+        Transforme le texte brut de l'admin en un message publicitaire
+        visuellement attractif.
+        """
+        raw = self.pub_message.strip()
+        border = "━" * 28
         return (
-            f"#N{game_number}. "
-            f"{p_prefix}{p_score}({p_cards_str}) "
-            f"{sep} "
-            f"{b_prefix}{b_score}({b_cards_str}) "
-            f"{total_str}"
+            f"╔{border}╗\n"
+            f"║  📣  *ANNONCE OFFICIELLE*  📣  ║\n"
+            f"╚{border}╝\n\n"
+            f"{raw}\n\n"
+            f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"🎰 *Bot Baccara* | Légiste Carte Enseigne 🤴💰"
         )
 
-    async def parties_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /parties - Affiche les jeux récupérés de l'API en format compact."""
-        await update.message.reply_text("⏳ Récupération des données...", parse_mode='Markdown')
+    async def _dispatch_pub(self, context: ContextTypes.DEFAULT_TYPE):
+        """Envoie la publication vers tous les canaux (principal + redirections)."""
+        if not self.pub_message:
+            return
+        text = self._format_pub_message()
+        for ch in self._all_channels():
+            try:
+                await context.bot.send_message(chat_id=ch, text=text, parse_mode='Markdown')
+                logger.info(f"[Pub] Envoyé → canal {ch}")
+            except Exception as e:
+                logger.error(f"[Pub] Échec canal {ch}: {e}")
 
-        # Récupérer les données fraîches de l'API
-        results = get_latest_results()
+    async def _check_pub_by_game_count(self, context: ContextTypes.DEFAULT_TYPE, nb_new_games: int):
+        """
+        Incrémente le compteur de jeux redirigés et déclenche la pub
+        si le seuil défini est atteint.
+        """
+        if self.pub_every_n_games <= 0 or not self.pub_message:
+            return
 
-        lines = ["🎰 *Parties Baccara en cours / récentes*\n"]
+        self.pub_games_counter += nb_new_games
+        logger.info(f"[Pub/msg] Compteur: {self.pub_games_counter}/{self.pub_every_n_games}")
 
-        if results:
-            results_sorted = sorted(results, key=lambda r: r['game_number'])
-            for r in results_sorted:
-                lines.append(self._format_game_line(r['game_number'], r))
-        else:
-            lines.append("⚠️ Aucune donnée disponible depuis l'API.")
+        if self.pub_games_counter >= self.pub_every_n_games:
+            self.pub_games_counter = 0
+            logger.info(f"[Pub/msg] Seuil atteint → envoi de la publication")
+            await self._dispatch_pub(context)
 
-        # Historique récent (8 dernières parties terminées)
-        finished = {k: v for k, v in self.history.items() if v.get('is_finished')}
-        if finished:
-            recent_nums = sorted(finished.keys(), reverse=True)[:8]
-            # Exclure ceux déjà dans les résultats API
-            api_nums = {r['game_number'] for r in results} if results else set()
-            extra = [n for n in sorted(recent_nums) if n not in api_nums]
-            if extra:
-                lines.append("\n📋 *Historique récent:*")
-                for num in extra:
-                    lines.append(self._format_game_line(num, finished[num]))
+    # ─────────────────────────────────────────────
+    # REDIRECTION VERS LES CANAUX (supprimé — remplacé par _send_single_game_to_channels)
+    # ─────────────────────────────────────────────
 
-        text = '\n'.join(lines)
-        if len(text) > 4000:
-            text = text[:4000] + "\n_...tronqué_"
+    # ─────────────────────────────────────────────
+    # BOUCLE PRINCIPALE
+    # ─────────────────────────────────────────────
 
+    async def collect_and_redirect(self, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Boucle principale :
+        1. Édite les messages des jeux EN COURS qui viennent de se TERMINER
+        2. Envoie les nouveaux jeux avec cartes (⏰ si en cours, résultat final si terminé)
+        3. Ignore les jeux "Prématch" sans aucune carte (on réessaie au prochain poll)
+        """
         try:
-            await update.message.reply_text(text, parse_mode='Markdown')
-        except Exception:
-            await update.message.reply_text(text)
+            self.last_check = datetime.now()
 
-    # ========== COMMANDE REDIRECTION ==========
+            results = get_latest_results()
+            if not results:
+                logger.warning("Aucune donnée reçue de l'API")
+                return
+
+            self.last_api_game = max(results, key=lambda r: r['game_number'])
+            self.last_results = results
+            self.history = update_history(results, self.history)
+
+            current_map = {r['game_number']: r for r in results}
+
+            # ── Premier démarrage : mémoriser uniquement les jeux TERMINÉS sans les renvoyer ──
+            # Les jeux en cours ou prématch sont laissés pour être traités normalement
+            if not self.seen_game_nums and not self.pending_games:
+                finished_at_start = {r['game_number'] for r in results if r.get('is_finished', False)}
+                self.seen_game_nums = finished_at_start
+                logger.info(
+                    f"[Init] {len(finished_at_start)} jeux terminés mémorisés "
+                    f"({len(results) - len(finished_at_start)} en cours seront traités au prochain poll)."
+                )
+                return
+
+            nb_sent = 0
+
+            # ── ÉTAPE 1 : Mettre à jour les jeux pending à chaque poll ──
+            for gnum in list(self.pending_games.keys()):
+                game_data = current_map.get(gnum)
+
+                if game_data is None:
+                    # Jeu disparu de l'API → abandon
+                    logger.warning(f"[Pending] #N{gnum} disparu de l'API, abandon.")
+                    del self.pending_games[gnum]
+                    self.seen_game_nums.add(gnum)
+                    continue
+
+                new_text = self._format_game_full(gnum, game_data)
+                if new_text:
+                    # Édite si le texte a changé (nouvelles cartes ou état terminé)
+                    await self._edit_game_messages(context, gnum, new_text)
+
+                if game_data.get('is_finished', False):
+                    # Jeu terminé → sortir du pending
+                    del self.pending_games[gnum]
+                    self.seen_game_nums.add(gnum)
+                    nb_sent += 1
+
+            # ── ÉTAPE 2 : Nouveaux jeux (pas dans seen, pas dans pending) ──
+            all_handled = self.seen_game_nums | set(self.pending_games.keys())
+            new_nums = sorted(n for n in current_map if n not in all_handled)
+
+            for gnum in new_nums:
+                game_data = current_map[gnum]
+                p_cards = game_data.get('player_cards', [])
+                b_cards = game_data.get('banker_cards', [])
+                is_finished = game_data.get('is_finished', False)
+                has_cards = len(p_cards) > 0 or len(b_cards) > 0
+
+                if not has_cards and not is_finished:
+                    # Prématch sans cartes → ignorer ce poll, réessayer au suivant
+                    continue
+
+                msg = self._format_game_full(gnum, game_data)
+                if not msg:
+                    continue
+
+                if is_finished:
+                    # Jeu déjà terminé → envoyer directement, pas de tracking
+                    await self._send_single_game_to_channels(context, msg)
+                    self.seen_game_nums.add(gnum)
+                    nb_sent += 1
+                else:
+                    # Jeu en cours avec cartes → envoyer ⏰ et suivre l'ID pour édition future
+                    await self._send_and_track_game(context, msg, gnum)
+
+            if nb_sent > 0:
+                await self._check_pub_by_game_count(context, nb_sent)
+
+        except Exception as e:
+            logger.error(f"Erreur dans collect_and_redirect: {e}")
+            if self.notify_on_error:
+                await self._notify_admin(context, f"Erreur collecte: {e}")
+
+    # ─────────────────────────────────────────────
+    # COMMANDES TELEGRAM
+    # ─────────────────────────────────────────────
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Commande /start — Menu principal."""
+        user = update.effective_user
+        is_admin = self._is_admin(user.id)
+
+        keyboard = [
+            [InlineKeyboardButton("📊 Status", callback_data='status'),
+             InlineKeyboardButton("⚙️ Configuration", callback_data='config')],
+            [InlineKeyboardButton("📡 Canaux", callback_data='channels')]
+        ]
+
+        commandes_base = (
+            "📋 *COMMANDES DISPONIBLES*\n\n"
+            "👤 *Général*\n"
+            "`/start` — Menu principal\n"
+            "`/status` — État du bot\n"
+            "`/jeu` — Dernier jeu terminé (détaillé)\n"
+            "`/derniers` — 5 derniers jeux API (format redirection)\n"
+            "`/parties` — Jeux récents en cours\n"
+        )
+        commandes_admin = (
+            "\n🔐 *Admin seulement*\n"
+            "`/config` — Configuration\n"
+            "`/redirect [add|remove|list] [ID]` — Gérer les canaux\n"
+            "`/setemoji <emoji>` — Changer l'emoji des jeux en cours\n"
+            "`/setpub <texte>` — Définir le message de pub (aperçu auto)\n"
+            "`/startpub min <N>` — Pub toutes les N minutes\n"
+            "`/startpub msg <N>` — Pub toutes les N parties redirigées\n"
+            "`/stoppub [min|msg]` — Arrêter la pub (un ou tous les modes)\n"
+        ) if is_admin else ""
+
+        await update.message.reply_text(
+            f"🎰 *Bot Baccara — Redirecteur de données*\n\n"
+            f"Bienvenue {user.first_name}!\n"
+            f"Ce bot collecte les données de l'API 1xBet et les redistribue\n"
+            f"en temps réel vers tous vos canaux Telegram.\n\n"
+            f"📡 Canal principal: `{self.main_channel}`\n"
+            f"🔀 Canaux actifs: `{len(self.redirect_channels)}`\n"
+            f"⏱ Intervalle: `{self.check_interval}s`\n\n"
+            f"{commandes_base}{commandes_admin}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Commande /status — État du bot."""
+        await update.message.reply_text(self._build_status_text(), parse_mode='Markdown')
+
+    def _build_status_text(self) -> str:
+        collecte = "🟢 Active" if self.is_running else "🔴 Arrêtée"
+        last_check = self.last_check.strftime('%H:%M:%S') if self.last_check else 'Jamais'
+        last_game = f"#{self.last_api_game['game_number']}" if self.last_api_game else 'En attente...'
+        total_channels = len(self._all_channels())
+        last_sent = max(self.seen_game_nums) if self.seen_game_nums else 0
+        return (
+            f"📊 *État du Bot*\n\n"
+            f"📡 Collecte de données: {collecte}\n"
+            f"🕐 Dernière vérification: `{last_check}`\n"
+            f"🔢 Dernier jeu API: `{last_game}`\n"
+            f"🎮 Jeux en mémoire: `{len(self.history)}`\n"
+            f"🔀 Dernier jeu envoyé: `#{last_sent}`\n"
+            f"📨 Jeux envoyés (session): `{len(self.seen_game_nums)}`\n\n"
+            f"📡 Canal principal: `{self.main_channel}`\n"
+            f"🔀 Canaux de redirection: `{len(self.redirect_channels)}`\n"
+            f"🌐 Total canaux actifs: `{total_channels}`\n"
+            f"👤 Admin: `{self.admin_id}`"
+        )
+
+    async def config_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Commande /config — Configuration (admin)."""
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text(self._admin_only_text())
+            return
+        text, markup = self._build_config_message()
+        await update.message.reply_text(text, reply_markup=markup, parse_mode='Markdown')
+
+    def _build_config_message(self):
+        keyboard = [
+            [InlineKeyboardButton("🌍 Langue", callback_data='cfg_language'),
+             InlineKeyboardButton("⏱ Intervalle", callback_data='cfg_interval')],
+            [InlineKeyboardButton("📡 Canaux", callback_data='channels')]
+        ]
+        text = (
+            f"⚙️ *Configuration actuelle*\n\n"
+            f"🌍 Langue: `{self.language}`\n"
+            f"⏱ Intervalle: `{self.check_interval}s`\n"
+            f"📡 Canal principal: `{self.main_channel}`\n"
+            f"🔀 Canaux de redirection: `{len(self.redirect_channels)}`\n"
+            f"🌐 Total canaux: `{len(self._all_channels())}`"
+        )
+        return text, InlineKeyboardMarkup(keyboard)
 
     async def redirect_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /redirect [add|remove|list] [CHANNEL_ID]
-        - /redirect list              → affiche les canaux
-        - /redirect add -1001234567  → ajoute un canal
-        - /redirect remove -1001234  → retire un canal
-        - /redirect -1001234567      → raccourci pour add
         """
-        user = update.effective_user
-        if not self._is_admin(user.id):
-            await update.message.reply_text(self._t('admin_only'))
+        /redirect list              — liste les canaux
+        /redirect add -1001234567   — ajoute un canal
+        /redirect remove -1001234   — retire un canal
+        /redirect -1001234567       — raccourci pour add
+        """
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text(self._admin_only_text())
             return
 
         args = context.args or []
 
-        # Pas d'argument ou 'list'
         if not args or args[0].lower() == 'list':
             if self.redirect_channels:
                 ch_list = '\n'.join(f"• `{c}`" for c in self.redirect_channels)
-                text = f"📡 *Canaux de redirection actifs:*\n{ch_list}"
+                text = (
+                    f"📡 *Canaux de redirection ({len(self.redirect_channels)}):*\n"
+                    f"{ch_list}\n\n"
+                    f"🌐 Total canaux (avec principal): `{len(self._all_channels())}`"
+                )
             else:
                 text = (
                     "📡 Aucun canal de redirection configuré.\n\n"
@@ -1025,7 +725,6 @@ class BaccaraBot:
             await update.message.reply_text(text, parse_mode='Markdown')
             return
 
-        # Raccourci: /redirect ID (sans add/remove)
         if args[0] not in ('add', 'remove') and len(args) == 1:
             args = ['add'] + args
 
@@ -1056,18 +755,18 @@ class BaccaraBot:
                 self.redirect_channels.append(channel_id)
                 self.config.update('telegram', 'redirect_channels', self.redirect_channels)
                 await update.message.reply_text(
-                    f"✅ Canal `{channel_id}` ajouté aux redirections.\n"
-                    f"Total: {len(self.redirect_channels)} canal(aux)",
+                    f"✅ Canal `{channel_id}` ajouté.\n"
+                    f"Total canaux de redirection: `{len(self.redirect_channels)}`\n"
+                    f"Total canaux actifs: `{len(self._all_channels())}`",
                     parse_mode='Markdown'
                 )
-
         elif action == 'remove':
             if channel_id in self.redirect_channels:
                 self.redirect_channels.remove(channel_id)
                 self.config.update('telegram', 'redirect_channels', self.redirect_channels)
                 await update.message.reply_text(
-                    f"✅ Canal `{channel_id}` retiré des redirections.\n"
-                    f"Total restant: {len(self.redirect_channels)}",
+                    f"✅ Canal `{channel_id}` retiré.\n"
+                    f"Total restant: `{len(self.redirect_channels)}`",
                     parse_mode='Markdown'
                 )
             else:
@@ -1080,20 +779,17 @@ class BaccaraBot:
             )
 
     async def jeu_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /jeu - Affiche le dernier jeu terminé avec ses cartes."""
-        # Trouver le dernier jeu terminé dans l'historique
+        """Commande /jeu — Dernier jeu terminé."""
         finished_games = {k: v for k, v in self.history.items() if v.get('is_finished')}
 
         if not finished_games:
-            # Aucun jeu terminé, afficher le dernier récupéré (prématch)
             if self.last_api_game is None:
                 await update.message.reply_text(
                     "⏳ *Aucune donnée disponible pour l'instant.*\n"
-                    "Le bot est en train de collecter les résultats, réessaie dans 30 secondes.",
+                    "Le bot collecte les résultats, réessaie dans 30 secondes.",
                     parse_mode='Markdown'
                 )
                 return
-
             g = self.last_api_game
             await update.message.reply_text(
                 f"⏳ *Jeu en attente*\n\n"
@@ -1104,15 +800,12 @@ class BaccaraBot:
             )
             return
 
-        # Dernier jeu terminé
         last_num = max(finished_games.keys())
         last_game = finished_games[last_num]
 
-        # Bloc principal
         text = "🎰 *DERNIER JEU BACCARA*\n\n"
         text += self._format_single_game(last_num, last_game)
 
-        # Historique des 4 jeux précédents
         previous = sorted([k for k in finished_games if k != last_num], reverse=True)[:4]
         if previous:
             text += "\n\n```\n─────────────────```\n"
@@ -1123,95 +816,464 @@ class BaccaraBot:
                 icon = "👤" if winner == 'Player' else "🏦" if winner == 'Banker' else "🤝"
                 p_cards = self._format_cards(g.get('player_cards', []))
                 b_cards = self._format_cards(g.get('banker_cards', []))
-                text += (
-                    f"*Jeu #{num}* {icon}\n"
-                    f"  👤 `{p_cards}`  🏦 `{b_cards}`\n\n"
-                )
+                text += f"*Jeu #{num}* {icon}\n  👤 `{p_cards}`  🏦 `{b_cards}`\n\n"
 
         text += f"\n_🎮 Total en mémoire : {len(finished_games)} jeux_"
-
         await update.message.reply_text(text, parse_mode='Markdown')
 
     async def dernier_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /dernier - Alias de /jeu."""
         await self.jeu_command(update, context)
 
-    # ========== UPLOAD DE FICHIERS ==========
+    async def parties_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Commande /parties — Jeux récents en format compact."""
+        await update.message.reply_text("⏳ Récupération des données...", parse_mode='Markdown')
 
-    async def upload_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Commande /upload."""
-        await update.message.reply_text(
-            "📎 Envoyez un fichier .txt ou .pdf contenant la liste des costumes."
+        results = get_latest_results()
+        lines = ["🎰 *Parties Baccara en cours / récentes*\n"]
+
+        if results:
+            results_sorted = sorted(results, key=lambda r: r['game_number'])
+            for r in results_sorted:
+                lines.append(self._format_game_line(r['game_number'], r))
+        else:
+            lines.append("⚠️ Aucune donnée disponible depuis l'API.")
+
+        finished = {k: v for k, v in self.history.items() if v.get('is_finished')}
+        if finished:
+            recent_nums = sorted(finished.keys(), reverse=True)[:8]
+            api_nums = {r['game_number'] for r in results} if results else set()
+            extra = [n for n in sorted(recent_nums) if n not in api_nums]
+            if extra:
+                lines.append("\n📋 *Historique récent:*")
+                for num in extra:
+                    lines.append(self._format_game_line(num, finished[num]))
+
+        text = '\n'.join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n_...tronqué_"
+
+        try:
+            await update.message.reply_text(text, parse_mode='Markdown')
+        except Exception:
+            await update.message.reply_text(text)
+
+    # ─────────────────────────────────────────────
+    # COMMANDE : 5 DERNIERS JEUX API
+    # ─────────────────────────────────────────────
+
+    async def derniers_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /derniers — Affiche les 5 derniers jeux terminés récupérés de l'API
+        dans le format de redirection (Légiste Carte Enseigne).
+        """
+        finished = {k: v for k, v in self.history.items() if v.get('is_finished')}
+
+        if not finished:
+            await update.message.reply_text(
+                "⏳ *Aucun jeu terminé en mémoire.*\n"
+                "Le bot collecte encore les premières données, réessaie dans 30 secondes.",
+                parse_mode='Markdown'
+            )
+            return
+
+        recent_nums = sorted(finished.keys(), reverse=True)[:5]
+
+        lines = []
+        for num in sorted(recent_nums):
+            line = self._format_redirect_game_line(num, finished[num])
+            if line:
+                lines.append(line)
+
+        now_str = datetime.now().strftime('%H:%M:%S')
+        header = (
+            f"🕐 *{now_str}*  |  5 derniers jeux API\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+        body = '\n\n'.join(lines) if lines else "_Aucune donnée disponible_"
+        footer = (
+            f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎰 Légiste Carte Enseigne 🤴💰"
         )
 
-    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Traite les documents uploadés."""
-        document = update.message.document
-        file_name = document.file_name.lower()
+        await update.message.reply_text(header + body + footer, parse_mode='Markdown')
 
-        if file_name.endswith('.txt') or file_name.endswith('.pdf'):
-            # Créer le dossier uploads
-            uploads_dir = self.config.get('paths', 'uploads_dir', 'uploads/')
-            os.makedirs(uploads_dir, exist_ok=True)
+    # ─────────────────────────────────────────────
+    # PUBLICITÉ
+    # ─────────────────────────────────────────────
 
-            # Télécharger
-            file = await context.bot.get_file(document.file_id)
-            temp_path = os.path.join(uploads_dir, document.file_name)
-            await file.download_to_drive(temp_path)
+    async def setpub_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /setpub <message> — Définit le message publicitaire.
+        Affiche un aperçu formaté du message.
+        """
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text(self._admin_only_text())
+            return
 
+        if not context.args:
+            if self.pub_message:
+                preview = self._format_pub_message()
+                await update.message.reply_text(
+                    f"📢 *Message publicitaire actuel (aperçu):*\n\n{preview}\n\n"
+                    f"_Pour modifier: `/setpub Nouveau message ici`_",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text(
+                    "📢 *Aucun message publicitaire défini.*\n\n"
+                    "Pour définir:\n`/setpub Votre texte ici`\n\n"
+                    "Ensuite pour programmer l'envoi:\n"
+                    "`/startpub min 30` — toutes les 30 minutes\n"
+                    "`/startpub msg 20` — toutes les 20 parties redirigées",
+                    parse_mode='Markdown'
+                )
+            return
+
+        self.pub_message = ' '.join(context.args)
+        preview = self._format_pub_message()
+        await update.message.reply_text(
+            f"✅ *Message publicitaire enregistré!*\n\n"
+            f"*Aperçu:*\n\n{preview}\n\n"
+            f"_Programmez l'envoi avec:_\n"
+            f"`/startpub min 30` — toutes les 30 minutes\n"
+            f"`/startpub msg 20` — toutes les 20 parties redirigées",
+            parse_mode='Markdown'
+        )
+
+    async def startpub_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /startpub min <N>  — envoie la pub toutes les N minutes
+        /startpub msg <N>  — envoie la pub après chaque N jeux redirigés
+        /startpub <N>      — raccourci pour 'min N' (compatibilité)
+        Les deux modes peuvent être actifs simultanément.
+        """
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text(self._admin_only_text())
+            return
+
+        if not self.pub_message:
             await update.message.reply_text(
-                f"✅ Fichier `{document.file_name}` reçu!\n"
-                f"Traitement en cours...",
+                "❌ Aucun message publicitaire défini.\n"
+                "Utilisez d'abord: `/setpub Votre message ici`",
+                parse_mode='Markdown'
+            )
+            return
+
+        args = context.args or []
+
+        if not args:
+            await update.message.reply_text(
+                "❌ *Usage:*\n"
+                "`/startpub min 30` — toutes les 30 minutes\n"
+                "`/startpub msg 20` — toutes les 20 parties redirigées\n"
+                "`/startpub 30`     — raccourci pour 30 minutes",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Détecter le mode
+        if args[0].lower() == 'min':
+            mode = 'min'
+            val_str = args[1] if len(args) > 1 else ''
+        elif args[0].lower() == 'msg':
+            mode = 'msg'
+            val_str = args[1] if len(args) > 1 else ''
+        else:
+            # Raccourci : /startpub 30 → mode min
+            mode = 'min'
+            val_str = args[0]
+
+        try:
+            val = int(val_str)
+            if val < 1:
+                raise ValueError
+        except (ValueError, IndexError):
+            await update.message.reply_text(
+                "❌ Valeur invalide.\n"
+                "`/startpub min 30` — minutes\n"
+                "`/startpub msg 20` — nombre de parties",
+                parse_mode='Markdown'
+            )
+            return
+
+        all_ch = self._all_channels()
+
+        if mode == 'min':
+            self.pub_interval_minutes = val
+            self.pub_enabled = True
+
+            if self.pub_job:
+                self.pub_job.schedule_removal()
+                self.pub_job = None
+
+            self.pub_job = context.job_queue.run_repeating(
+                self._send_pub_job,
+                interval=val * 60,
+                first=val * 60,
+                name='pub_automatique'
+            )
+            await update.message.reply_text(
+                f"📢 *Pub par intervalle de temps activée!*\n\n"
+                f"⏱ Toutes les: `{val} minutes`\n"
+                f"📡 Canaux: `{len(all_ch)}`\n\n"
+                f"*Aperçu du message:*\n\n{self._format_pub_message()}",
+                parse_mode='Markdown'
+            )
+            logger.info(f"[Pub/min] Démarrage toutes les {val} min → {len(all_ch)} canaux")
+
+        else:  # mode == 'msg'
+            self.pub_every_n_games = val
+            self.pub_games_counter = 0
+            await update.message.reply_text(
+                f"📢 *Pub par nombre de parties activée!*\n\n"
+                f"🎮 Toutes les: `{val} parties redirigées`\n"
+                f"📡 Canaux: `{len(all_ch)}`\n"
+                f"🔢 Compteur remis à zéro\n\n"
+                f"*Aperçu du message:*\n\n{self._format_pub_message()}",
+                parse_mode='Markdown'
+            )
+            logger.info(f"[Pub/msg] Démarrage toutes les {val} parties → {len(all_ch)} canaux")
+
+    async def stoppub_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /stoppub        — arrête tous les modes de pub
+        /stoppub min    — arrête uniquement le mode minuteur
+        /stoppub msg    — arrête uniquement le mode compteur de parties
+        """
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text(self._admin_only_text())
+            return
+
+        args = context.args or []
+        mode = args[0].lower() if args else 'all'
+
+        stopped = []
+
+        if mode in ('all', 'min'):
+            if self.pub_job:
+                self.pub_job.schedule_removal()
+                self.pub_job = None
+            self.pub_enabled = False
+            stopped.append("⏱ Mode minuteur")
+
+        if mode in ('all', 'msg'):
+            self.pub_every_n_games = 0
+            self.pub_games_counter = 0
+            stopped.append("🎮 Mode compteur de parties")
+
+        if stopped:
+            await update.message.reply_text(
+                f"🛑 *Publication arrêtée:*\n" + '\n'.join(f"• {s}" for s in stopped),
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Mode inconnu. Utilisez `/stoppub`, `/stoppub min` ou `/stoppub msg`",
+                parse_mode='Markdown'
+            )
+        logger.info(f"[Pub] Arrêt: {stopped}")
+
+    async def _send_pub_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Job répété (mode minuteur) — envoie la pub via _dispatch_pub."""
+        if not self.pub_enabled or not self.pub_message:
+            return
+        await self._dispatch_pub(context)
+
+    # ─────────────────────────────────────────────
+    # COMMANDE : CHANGER L'EMOJI DES JEUX EN COURS
+    # ─────────────────────────────────────────────
+
+    async def setemoji_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /setemoji <emoji>  — Change l'emoji affiché devant les jeux en cours (défaut ⏰).
+        /setemoji reset    — Remet l'emoji par défaut (⏰).
+        /setemoji          — Affiche l'emoji actuel.
+        """
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text(self._admin_only_text())
+            return
+
+        args = context.args or []
+
+        if not args:
+            await update.message.reply_text(
+                f"⚙️ *Emoji actuel pour les jeux en cours:* `{self.pending_emoji}`\n\n"
+                f"Pour changer: `/setemoji 🔴`\n"
+                f"Pour réinitialiser: `/setemoji reset`",
+                parse_mode='Markdown'
+            )
+            return
+
+        new_emoji = args[0]
+
+        if new_emoji.lower() == 'reset':
+            new_emoji = '⏰'
+
+        self.pending_emoji = new_emoji
+        self.config.update('app', 'pending_emoji', new_emoji)
+
+        await update.message.reply_text(
+            f"✅ *Emoji mis à jour!*\n\n"
+            f"Nouvel emoji: `{new_emoji}`\n"
+            f"Exemple d'affichage: `{new_emoji}#N650. ▶️1(3♥️8♠️) - 4(Q♦️4♦️)`\n\n"
+            f"_Ce changement s'applique immédiatement aux prochains jeux en cours._",
+            parse_mode='Markdown'
+        )
+        logger.info(f"[Config] Emoji jeux en cours changé → {new_emoji}")
+
+    # ─────────────────────────────────────────────
+    # CALLBACKS INLINE (BOUTONS)
+    # ─────────────────────────────────────────────
+
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        user = query.from_user
+
+        if query.data == 'status':
+            keyboard = [[InlineKeyboardButton("🔙 Retour", callback_data='menu')]]
+            await query.edit_message_text(
+                self._build_status_text(),
+                reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode='Markdown'
             )
 
-            # TODO: Logique de traitement du fichier
-        else:
-            await update.message.reply_text(
-                "❌ Format non supporté. Envoyez un fichier .txt ou .pdf"
+        elif query.data == 'config':
+            if not self._is_admin(user.id):
+                await query.edit_message_text(self._admin_only_text())
+                return
+            text, markup = self._build_config_message()
+            await query.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
+
+        elif query.data == 'channels':
+            keyboard = [[InlineKeyboardButton("🔙 Retour", callback_data='menu')]]
+            all_ch = self._all_channels()
+            if all_ch:
+                ch_list = '\n'.join(f"• `{c}`" for c in all_ch)
+                text = (
+                    f"📡 *Tous les canaux actifs ({len(all_ch)}):*\n\n"
+                    f"{ch_list}\n\n"
+                    f"_Utilisez `/redirect add ID` pour ajouter un canal._"
+                )
+            else:
+                text = "📡 Aucun canal configuré."
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+        elif query.data == 'menu':
+            keyboard = [
+                [InlineKeyboardButton("📊 Status", callback_data='status'),
+                 InlineKeyboardButton("⚙️ Configuration", callback_data='config')],
+                [InlineKeyboardButton("📡 Canaux", callback_data='channels')]
+            ]
+            await query.edit_message_text(
+                "🎰 *Bot Baccara — Redirecteur* — Menu principal",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
             )
 
-    # ========== DÉMARRAGE ==========
+        elif query.data == 'cfg_language':
+            if not self._is_admin(user.id):
+                await query.edit_message_text(self._admin_only_text())
+                return
+            langs = ['FR', 'EN', 'ES', 'DE', 'RU', 'AR']
+            keyboard = [
+                [InlineKeyboardButton(
+                    f"{'✅ ' if lg == self.language else ''}{lg}",
+                    callback_data=f'set_lang_{lg}'
+                ) for lg in langs],
+                [InlineKeyboardButton("🔙 Retour", callback_data='config')]
+            ]
+            await query.edit_message_text(
+                f"🌍 *Choisir la langue*\nLangue actuelle: `{self.language}`",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+
+        elif query.data.startswith('set_lang_'):
+            if not self._is_admin(user.id):
+                await query.edit_message_text(self._admin_only_text())
+                return
+            new_lang = query.data.replace('set_lang_', '')
+            self.language = new_lang
+            self.config.update('app', 'language', new_lang)
+            text, markup = self._build_config_message()
+            await query.edit_message_text(
+                f"✅ Langue changée en `{new_lang}`\n\n" + text,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+
+        elif query.data == 'cfg_interval':
+            if not self._is_admin(user.id):
+                await query.edit_message_text(self._admin_only_text())
+                return
+            options = [10, 15, 30, 60]
+            keyboard = [
+                [InlineKeyboardButton(
+                    f"{'✅ ' if iv == self.check_interval else ''}{iv}s",
+                    callback_data=f'set_interval_{iv}'
+                ) for iv in options],
+                [InlineKeyboardButton("🔙 Retour", callback_data='config')]
+            ]
+            await query.edit_message_text(
+                f"⏱ *Choisir l'intervalle de collecte*\nActuel: `{self.check_interval}s`",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+
+        elif query.data.startswith('set_interval_'):
+            if not self._is_admin(user.id):
+                await query.edit_message_text(self._admin_only_text())
+                return
+            new_interval = int(query.data.replace('set_interval_', ''))
+            self.check_interval = new_interval
+            self.config.update('app', 'check_interval_seconds', new_interval)
+            text, markup = self._build_config_message()
+            await query.edit_message_text(
+                f"✅ Intervalle changé à `{new_interval}s`\n\n" + text,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+
+    # ─────────────────────────────────────────────
+    # DÉMARRAGE
+    # ─────────────────────────────────────────────
 
     def run(self):
         """Démarre le bot."""
         if not self.token:
-            logger.error("Bot token not configured!")
+            logger.error("Token Telegram non configuré!")
             return
 
-        # Démarrer le serveur HTTP pour Render.com (port 10000 par défaut)
         web_port = int(os.environ.get("PORT", 10000))
         set_bot(self)
         start_web_server(port=web_port)
 
         application = Application.builder().token(self.token).build()
 
-        # Commandes
         application.add_handler(CommandHandler("start", self.start_command))
-        application.add_handler(CommandHandler("stats", self.stats_command))
         application.add_handler(CommandHandler("status", self.status_command))
         application.add_handler(CommandHandler("config", self.config_command))
-        application.add_handler(CommandHandler("upload", self.upload_command))
-        application.add_handler(CommandHandler("dernier", self.dernier_command))
-        application.add_handler(CommandHandler("jeu", self.jeu_command))
-        application.add_handler(CommandHandler("parties", self.parties_command))
         application.add_handler(CommandHandler("redirect", self.redirect_command))
+        application.add_handler(CommandHandler("jeu", self.jeu_command))
+        application.add_handler(CommandHandler("dernier", self.dernier_command))
+        application.add_handler(CommandHandler("derniers", self.derniers_command))
+        application.add_handler(CommandHandler("parties", self.parties_command))
+        application.add_handler(CommandHandler("setemoji", self.setemoji_command))
+        application.add_handler(CommandHandler("setpub", self.setpub_command))
+        application.add_handler(CommandHandler("startpub", self.startpub_command))
+        application.add_handler(CommandHandler("stoppub", self.stoppub_command))
 
-        # Callbacks inline (boutons)
         application.add_handler(CallbackQueryHandler(self.button_callback))
 
-        # Documents
-        application.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
-
-        # Job récurrent
         application.job_queue.run_repeating(
-            self.check_and_predict,
+            self.collect_and_redirect,
             interval=self.check_interval,
             first=10,
-            name='baccara_monitor'
+            name='baccara_redirecteur'
         )
 
-        logger.info("Starting Baccara Bot...")
+        logger.info(f"Bot démarré — Redirection vers {len(self.redirect_channels)} canaux, intervalle {self.check_interval}s")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
