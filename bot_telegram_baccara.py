@@ -107,6 +107,9 @@ class BaccaraBot:
         # Emoji personnalisable pour les jeux en cours
         self.pending_emoji = self.config.get('app', 'pending_emoji', '⏰')
 
+        # Emoji personnalisable pour le séparateur d'égalité (Tie)
+        self.tie_emoji = self.config.get('app', 'tie_emoji', '🔰')
+
         logger.info(f"Bot initialisé — Canal principal: {self.main_channel}, Canaux: {len(self.redirect_channels)}, Admin: {self.admin_id}")
 
     # ─────────────────────────────────────────────
@@ -223,8 +226,16 @@ class BaccaraBot:
 
         winner = game_data.get('winner')
 
+        # Détection de l'égalité par comparaison de scores si winner non fourni
+        if winner not in ('Player', 'Banker', 'Tie'):
+            try:
+                if int(p_score) == int(b_score):
+                    winner = 'Tie'
+            except (TypeError, ValueError):
+                pass
+
         if winner == 'Tie':
-            sep = '🔰'
+            sep = self.tie_emoji
             p_prefix = ''
             b_prefix = ''
         else:
@@ -362,8 +373,16 @@ class BaccaraBot:
         winner = game_data.get('winner')
 
         if is_finished:
+            # Détection de l'égalité par comparaison de scores si winner non fourni
+            if winner not in ('Player', 'Banker', 'Tie'):
+                try:
+                    if int(p_score) == int(b_score):
+                        winner = 'Tie'
+                except (TypeError, ValueError):
+                    pass
+
             if winner == 'Tie':
-                sep = '🔰'
+                sep = self.tie_emoji
                 p_prefix = ''
                 b_prefix = ''
             else:
@@ -626,6 +645,7 @@ class BaccaraBot:
             "`/config` — Configuration\n"
             "`/redirect [add|remove|list] [ID]` — Gérer les canaux\n"
             "`/setemoji <emoji>` — Changer l'emoji des jeux en cours\n"
+            "`/settie <emoji>` — Changer l'emoji séparateur du match nul\n"
             "`/setpub <texte>` — Définir le message de pub (aperçu auto)\n"
             "`/startpub min <N>` — Pub toutes les N minutes\n"
             "`/startpub msg <N>` — Pub toutes les N parties redirigées\n"
@@ -1122,6 +1142,48 @@ class BaccaraBot:
         logger.info(f"[Config] Emoji jeux en cours changé → {new_emoji}")
 
     # ─────────────────────────────────────────────
+    # COMMANDE : CHANGER L'EMOJI DU SÉPARATEUR TIE
+    # ─────────────────────────────────────────────
+
+    async def settie_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /settie <emoji>  — Change l'emoji séparateur affiché pour les matchs nuls (défaut 🔰).
+        /settie reset    — Remet l'emoji par défaut (🔰).
+        /settie          — Affiche l'emoji actuel.
+        """
+        if not self._is_admin(update.effective_user.id):
+            await update.message.reply_text(self._admin_only_text())
+            return
+
+        args = context.args or []
+
+        if not args:
+            await update.message.reply_text(
+                f"⚙️ *Emoji actuel pour les matchs nuls (Tie):* `{self.tie_emoji}`\n\n"
+                f"Pour changer: `/settie 🏳️`\n"
+                f"Pour réinitialiser: `/settie reset`",
+                parse_mode='Markdown'
+            )
+            return
+
+        new_emoji = args[0]
+
+        if new_emoji.lower() == 'reset':
+            new_emoji = '🔰'
+
+        self.tie_emoji = new_emoji
+        self.config.update('app', 'tie_emoji', new_emoji)
+
+        await update.message.reply_text(
+            f"✅ *Emoji de match nul mis à jour!*\n\n"
+            f"Nouvel emoji: `{new_emoji}`\n"
+            f"Exemple d'affichage: `#N1130. 6(4♦️9♣️3♣️) {new_emoji} 6(2♠️J♦️4♥️) #T12 🟣#X`\n\n"
+            f"_Ce changement s'applique immédiatement aux prochains jeux._",
+            parse_mode='Markdown'
+        )
+        logger.info(f"[Config] Emoji tie changé → {new_emoji}")
+
+    # ─────────────────────────────────────────────
     # CALLBACKS INLINE (BOUTONS)
     # ─────────────────────────────────────────────
 
@@ -1260,6 +1322,7 @@ class BaccaraBot:
         application.add_handler(CommandHandler("derniers", self.derniers_command))
         application.add_handler(CommandHandler("parties", self.parties_command))
         application.add_handler(CommandHandler("setemoji", self.setemoji_command))
+        application.add_handler(CommandHandler("settie", self.settie_command))
         application.add_handler(CommandHandler("setpub", self.setpub_command))
         application.add_handler(CommandHandler("startpub", self.startpub_command))
         application.add_handler(CommandHandler("stoppub", self.stoppub_command))

@@ -11,7 +11,8 @@
     "app": {
         "language": "RU",
         "check_interval_seconds": 2,
-        "pending_emoji": "⚽"
+        "pending_emoji": "⚽",
+        "tie_emoji": "🔰"
     },
     "api": {
         "url": "https://1xbet.com/service-api/LiveFeed/GetSportsShortZip",
