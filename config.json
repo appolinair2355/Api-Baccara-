@@ -2,7 +2,7 @@
     "telegram": {
         "bot_token": "8168829272:AAEdBli_8E0Du_uHVTGLRLCN6KV7Gwox0WQ",
         "admin_id": 1190237801,
-        "main_channel": -1003798444695,
+        "main_channel": -1003828164284,
         "redirect_channels": [],
         "notification_on_error": true
     },
