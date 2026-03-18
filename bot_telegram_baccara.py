@@ -147,7 +147,7 @@ class BaccaraBot:
     # ─────────────────────────────────────────────
 
     def _fmt_rank(self, r) -> str:
-        rank_labels = {0: '10', 1: 'A', 10: '10', 11: 'J', 12: 'Q', 13: 'K'}
+        rank_labels = {0: '10', 1: 'A', 10: '10', 11: 'J', 12: 'Q', 13: 'K', 14: 'A'}
         if isinstance(r, int):
             return rank_labels.get(r, str(r))
         return str(r)
@@ -178,24 +178,32 @@ class BaccaraBot:
         return '  '.join(parts)
 
     def _calc_baccara_score(self, cards: List[Dict]) -> int:
-        """Calcule le score baccara d'une main (mod 10)."""
-        rank_values = {
+        """Calcule le score baccara d'une main (mod 10).
+        Valeurs : As=1, 2-9=valeur nominale, 10/J/Q/K=0.
+        Rangs API connus : 0=10, 1=As, 2-9=valeur, 10=10, 11=J, 12=Q, 13=K, 14=As.
+        """
+        int_rank_values = {
+            0: 0,   # 10
+            1: 1,   # As
+            2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9,
+            10: 0,  # 10
+            11: 0,  # J
+            12: 0,  # Q
+            13: 0,  # K
+            14: 1,  # As (représenté comme 14 dans l'API)
+        }
+        str_rank_values = {
             '10': 0, 'J': 0, 'Q': 0, 'K': 0, 'A': 1,
-            '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
+            '2': 2, '3': 3, '4': 4, '5': 5,
+            '6': 6, '7': 7, '8': 8, '9': 9,
         }
         total = 0
         for card in cards:
-            raw_r = card.get('raw_r', card.get('raw', -1))
-            if isinstance(raw_r, int) and raw_r >= 0:
-                if raw_r == 0 or raw_r >= 10:
-                    total += 0
-                elif raw_r == 1:
-                    total += 1
-                elif 2 <= raw_r <= 9:
-                    total += raw_r
+            r = card.get('R', None)
+            if isinstance(r, int):
+                total += int_rank_values.get(r, 0)
             else:
-                r = str(card.get('R', ''))
-                total += rank_values.get(r, 0)
+                total += str_rank_values.get(str(r), 0)
         return total % 10
 
     def _format_redirect_game_line(self, game_number: int, game_data: Dict) -> str:
